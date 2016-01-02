@@ -1,6 +1,6 @@
 # Gelf2Kafka
 
-Runs gelfd daemon that accepts felf events and pushes them to kafka.
+Runs gelfd daemon that accepts gelf events and pushes them to kafka.
 
 ## Installation
 
