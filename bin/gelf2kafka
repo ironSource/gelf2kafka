@@ -1,0 +1,121 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'gelfd'
+require 'poseidon'
+require 'yaml'
+require 'hash_symbolizer'
+require 'schash'
+require 'socket'
+require 'logger'
+
+$stdout.sync = true
+
+Thread.abort_on_exception = true
+
+@config = nil
+
+loglevels = {
+  :debug => Logger::DEBUG,
+  :info => Logger::INFO,
+  :warn => Logger::WARN,
+  :error => Logger::Error,
+  :fatal => Logger::FATAL,
+  :unknown => Logger::UNKNOWN
+}
+
+@loglevel = Logger::INFO
+
+opts = OptionParser.new
+opts.banner = "Usage: #{$0} [options]"
+opts.on( '--config PATH', String, 'Path to settings config' ) { |c| @config = c }
+opts.on( '--log-level [LEVEL]', [:debug, :info, :warn, :error, :fatal, :unknown] ) { |l| @loglevel = loglevels[l] }
+opts.on( '-h', '--help', 'Display this screen' ) { puts opts; exit 0 }
+opts.parse!
+
+unless @config
+  puts opts
+  exit 1
+end
+
+@logger = Logger.new(STDOUT)
+
+@settings = YAML.load_file(@config).symbolize_keys(true)
+
+require 'pp'
+pp @settings
+
+
+validator = Schash::Validator.new do
+  {
+    gelfd: {
+      host: string,
+      port: integer,
+      flush_interval: integer,
+      max_batch_events: integer
+    },
+    kafka: {
+      brokers: array_of(string),
+      producer_type: match(/^(sync|async)$/),
+      produce: optional(boolean),
+      topic: string
+    },
+  }
+end
+
+unless validator.validate(@settings).empty?
+  @logger.error("ERROR: bad settings")
+  @logger.error(validator.validate(@settings))
+  exit 1
+end
+
+@gelfd_host = @settings[:gelfd][:host]
+@gelfd_port = @settings[:gelfd][:port]
+@flush_interval = @settings[:gelfd][:flush_interval]
+@max_batch_events = @settings[:gelfd][:max_batch_events]
+@brokers = @settings[:kafka][:brokers]
+@producer_type = @settings[:kafka][:producer_type].to_sym
+@produce = @settings[:kafka].has_key?(:produce) ? @settings[:kafka][:produce] : true
+@topic = @settings[:kafka][:topic]
+@producer = Poseidon::Producer.new(@brokers, "#{Socket.gethostname}", :type => @producer_type, :compression_codec => :snappy, :compressed_topics => @topics) if @produce
+
+@producer_queue = SizedQueue.new(@max_batch_events * 10)
+
+@producer_thread = Thread.new do
+  messages = []
+  loop do
+    msg = @producer_queue.pop
+pp msg
+    messages << Poseidon::MessageToSend.new(@topic, msg.strip)
+    if messages.size >= @max_batch_events
+      begin
+        @producer.send_messages(batch) if @produce
+      rescue Poseidon::Errors::UnableToFetchMetadata
+        @logger.warn("Got Poseidon::Errors::UnableToFetchMetadata while trying to produce kafka messages, retrying in 1 second ...")
+        sleep 1
+        retry
+      end
+      messages = []
+    end
+  end
+end
+
+def gelfd
+  server = UDPSocket.new
+  @logger.info("binding gelfd to #{@gelfd_host}:#{@gelfd_port}")
+  server.bind(@gelfd_host, @gelfd_port)
+
+  loop do
+    data, addr = server.recvfrom(8192)
+    begin
+      res = Gelfd::Parser.parse(data)
+      @producer_queue.push(res)
+    rescue Exception => e
+      @logger.warn("Failed parsing gelf message: #{e.message}")
+    end
+  end
+end
+
+gelfd
+
+join @producer_thread
