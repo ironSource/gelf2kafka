@@ -43,9 +43,6 @@ end
 
 @settings = YAML.load_file(@config).symbolize_keys(true)
 
-require 'pp'
-pp @settings
-
 validator = Schash::Validator.new do
   {
     gelfd: {
@@ -79,6 +76,8 @@ end
 @topic = @settings[:kafka][:topic]
 @producer = Poseidon::Producer.new(@brokers, "#{Socket.gethostname}", :type => @producer_type, :compression_codec => :snappy, :compressed_topics => [ @topic ]) if @produce
 
+@mutex = Mutex.new
+
 @producer_queue = SizedQueue.new(10)
 
 @producer_thread = Thread.new do
@@ -96,8 +95,9 @@ end
 
 @timers = Timers::Group.new
 @flush_timer = @timers.every(@flush_interval) do
+  @logger.debug("Flush timer triggered with #{@messages.size} events")
   @mutex.synchronize do
-    @producer_queue.push(@messages)
+    @producer_queue.push(@messages) unless @messages.empty?
     @messages = []
   end
 end
@@ -116,8 +116,9 @@ def gelfd
       res = Gelfd::Parser.parse(data)
       unless res.nil?
         @mutex.synchronize do
-          @messages << Poseidon::MessageToSend.new(@topic, msg.strip)
+          @messages << Poseidon::MessageToSend.new(@topic, res.strip)
           if @messages.size >= @max_batch_events
+            @logger.debug("Max events threshold reached")
             @producer_queue.push(@messages)
             @messages = []
           end
