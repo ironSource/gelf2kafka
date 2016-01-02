@@ -20,6 +20,7 @@ Gem::Specification.new do |s|
   s.add_dependency('snappy')
   s.add_dependency('hash_symbolizer')
   s.add_dependency('schash')
+  s.add_dependency('timers')
 
   s.add_development_dependency('rake')
 

@@ -7,6 +7,7 @@ require 'yaml'
 require 'hash_symbolizer'
 require 'schash'
 require 'socket'
+require 'timers'
 require 'logger'
 
 $stdout.sync = true
@@ -45,7 +46,6 @@ end
 require 'pp'
 pp @settings
 
-
 validator = Schash::Validator.new do
   {
     gelfd: {
@@ -77,39 +77,52 @@ end
 @producer_type = @settings[:kafka][:producer_type].to_sym
 @produce = @settings[:kafka].has_key?(:produce) ? @settings[:kafka][:produce] : true
 @topic = @settings[:kafka][:topic]
-@producer = Poseidon::Producer.new(@brokers, "#{Socket.gethostname}", :type => @producer_type, :compression_codec => :snappy, :compressed_topics => @topics) if @produce
+@producer = Poseidon::Producer.new(@brokers, "#{Socket.gethostname}", :type => @producer_type, :compression_codec => :snappy, :compressed_topics => [ @topic ]) if @produce
 
-@producer_queue = SizedQueue.new(@max_batch_events * 10)
+@producer_queue = SizedQueue.new(10)
 
 @producer_thread = Thread.new do
-  messages = []
   loop do
-    msg = @producer_queue.pop
-pp msg
-    messages << Poseidon::MessageToSend.new(@topic, msg.strip)
-    if messages.size >= @max_batch_events
-      begin
-        @producer.send_messages(batch) if @produce
-      rescue Poseidon::Errors::UnableToFetchMetadata
-        @logger.warn("Got Poseidon::Errors::UnableToFetchMetadata while trying to produce kafka messages, retrying in 1 second ...")
-        sleep 1
-        retry
-      end
-      messages = []
+    messages = @producer_queue.pop
+    begin
+      @producer.send_messages(messages) if @produce
+    rescue Poseidon::Errors::UnableToFetchMetadata
+      @logger.warn("Got Poseidon::Errors::UnableToFetchMetadata while trying to produce kafka messages, retrying in 1 second ...")
+      sleep 1
+      retry
     end
   end
 end
+
+@timers = Timers::Group.new
+@flush_timer = @timers.every(@flush_interval) do
+  @mutex.synchronize do
+    @producer_queue.push(@messages)
+    @messages = []
+  end
+end
+Thread.new { loop { @timers.wait } }
 
 def gelfd
   server = UDPSocket.new
   @logger.info("binding gelfd to #{@gelfd_host}:#{@gelfd_port}")
   server.bind(@gelfd_host, @gelfd_port)
 
+  @messages = []
+
   loop do
     data, addr = server.recvfrom(8192)
     begin
       res = Gelfd::Parser.parse(data)
-      @producer_queue.push(res)
+      unless res.nil?
+        @mutex.synchronize do
+          @messages << Poseidon::MessageToSend.new(@topic, msg.strip)
+          if @messages.size >= @max_batch_events
+            @producer_queue.push(@messages)
+            @messages = []
+          end
+        end
+      end
     rescue Exception => e
       @logger.warn("Failed parsing gelf message: #{e.message}")
     end
@@ -117,5 +130,3 @@ def gelfd
 end
 
 gelfd
-
-join @producer_thread
