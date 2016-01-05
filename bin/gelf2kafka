@@ -40,6 +40,7 @@ unless @config
 end
 
 @logger = Logger.new(STDOUT)
+@logger.level = @loglevel
 
 @settings = YAML.load_file(@config).symbolize_keys(true)
 
