@@ -90,6 +90,9 @@ end
       @logger.warn("Got Poseidon::Errors::UnableToFetchMetadata while trying to produce kafka messages, retrying in 1 second ...")
       sleep 1
       retry
+    rescue => e
+      @logger.error("Got #{e.message} while trying to produce kafka messages aborting ...")
+      exit(1)
     end
   end
 end
