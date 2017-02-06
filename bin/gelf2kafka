@@ -55,7 +55,6 @@ validator = Schash::Validator.new do
       brokers: optional(string),
       consul_service: optional(string),
       consul_tag: optional(string),
-      batch_size: optional(integer),
       connect_timeout: optional(integer),
       socket_timeout: optional(integer),
       max_buffer_size: optional(integer),
