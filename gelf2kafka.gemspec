@@ -16,12 +16,11 @@ Gem::Specification.new do |s|
   s.has_rdoc    = false
 
   s.add_dependency('gelfd')
-  s.add_dependency('poseidon')
+  s.add_dependency('ruby-kafka')
   s.add_dependency('snappy')
   s.add_dependency('hash_symbolizer')
   s.add_dependency('schash')
-  s.add_dependency('timers')
-  s.add_dependency('activesupport', '~> 4.2.6')
+  s.add_dependency('diplomat')
 
   s.add_development_dependency('rake')
 

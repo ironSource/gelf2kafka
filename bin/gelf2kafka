@@ -2,13 +2,13 @@
 
 require 'optparse'
 require 'gelfd'
-require 'poseidon'
 require 'yaml'
 require 'hash_symbolizer'
 require 'schash'
 require 'socket'
-require 'timers'
 require 'logger'
+require 'diplomat'
+require 'kafka'
 
 $stdout.sync = true
 
@@ -48,16 +48,19 @@ validator = Schash::Validator.new do
   {
     gelfd: {
       host: string,
-      port: integer,
-      flush_interval: integer,
-      max_batch_events: integer
+      port: integer
     },
     kafka: {
-      brokers: array_of(string),
-      producer_type: match(/^(sync|async)$/),
-      produce: optional(boolean),
-      topic: string
-    },
+      topic: string,
+      brokers: optional(string),
+      consul_service: optional(string),
+      consul_tag: optional(string),
+      connect_timeout: optional(integer),
+      socket_timeout: optional(integer),
+      max_buffer_size: optional(integer),
+      delivery_threshold: optional(integer),
+      delivery_interval: optional(integer)
+    }
   }
 end
 
@@ -67,65 +70,53 @@ unless validator.validate(@settings).empty?
   exit 1
 end
 
+if not @settings[:kafka][:brokers] and not @settings[:kafka][:consul_service]
+  @logger.error("ERROR: nither brokers nor consul_service was specified")
+  exit 1
+end
+
 @gelfd_host = @settings[:gelfd][:host]
 @gelfd_port = @settings[:gelfd][:port]
-@flush_interval = @settings[:gelfd][:flush_interval]
-@max_batch_events = @settings[:gelfd][:max_batch_events]
-@brokers = @settings[:kafka][:brokers]
-@producer_type = @settings[:kafka][:producer_type].to_sym
-@produce = @settings[:kafka].has_key?(:produce) ? @settings[:kafka][:produce] : true
 @topic = @settings[:kafka][:topic]
-@producer = Poseidon::Producer.new(@brokers, "#{Socket.gethostname}", :type => @producer_type, :compression_codec => :snappy, :compressed_topics => [ @topic ]) if @produce
 
-@mutex = Mutex.new
-
-@producer_queue = SizedQueue.new(10)
-
-@producer_thread = Thread.new do
-  loop do
-    messages = @producer_queue.pop
-    begin
-      @producer.send_messages(messages) if @produce
-    rescue Poseidon::Errors::UnableToFetchMetadata
-      @logger.warn("Got Poseidon::Errors::UnableToFetchMetadata while trying to produce kafka messages, retrying in 1 second ...")
-      sleep 1
-      retry
-    rescue => e
-      @logger.error("Got #{e.message} while trying to produce kafka messages aborting ...")
-      exit(1)
-    end
+def kafka_connect
+  if @settings[:kafka].has_key?(:brokers)
+    kafka_nodes = @settings[:kafka][:brokers]
+  else
+    kafka_nodes = Diplomat::Service.get(@settings[:kafka][:consul_service], :all, {:tag => @settings[:kafka][:consul_tag]}).inject([]) {|hosts,h| hosts << "#{h.Node}:#{h.ServicePort}"; hosts}
   end
+  @kafka = Kafka.new(
+    seed_brokers: kafka_nodes,
+    logger: @logger,
+    connect_timeout: @settings[:kafka].has_key?(:socket_timeout) ? @settings[:kafka][:socket_timeout] : 10,
+    socket_timeout: @settings[:kafka].has_key?(:socket_timeout) ? @settings[:kafka][:socket_timeout] : 60
+  )
+  @producer = @kafka.async_producer(
+    required_acks: 0,
+    max_retries: 2,
+    retry_backoff: 1,
+    max_buffer_size: @settings[:kafka].has_key?(:max_buffer_size) ?  @settings[:kafka][:max_buffer_size] : 10000,
+    delivery_threshold: @settings[:kafka].has_key?(:delivery_threshold) ? @settings[:kafka][:delivery_threshold] : 100,
+    delivery_interval: @settings[:kafka].has_key?(:delivery_interval) ? @settings[:kafka][:delivery_interval] : 5,
+    compression_codec: :snappy,
+  )
 end
-
-@timers = Timers::Group.new
-@flush_timer = @timers.every(@flush_interval) do
-  @logger.debug("Flush timer triggered with #{@messages.size} events")
-  @mutex.synchronize do
-    @producer_queue.push(@messages) unless @messages.empty?
-    @messages = []
-  end
-end
-Thread.new { loop { @timers.wait } }
 
 def gelfd
   server = UDPSocket.new
   @logger.info("binding gelfd to #{@gelfd_host}:#{@gelfd_port}")
   server.bind(@gelfd_host, @gelfd_port)
 
-  @messages = []
-
   loop do
     data, addr = server.recvfrom(8192)
     begin
       res = Gelfd::Parser.parse(data)
       unless res.nil?
-        @mutex.synchronize do
-          @messages << Poseidon::MessageToSend.new(@topic, res.strip)
-          if @messages.size >= @max_batch_events
-            @logger.debug("Max events threshold reached")
-            @producer_queue.push(@messages)
-            @messages = []
-          end
+        begin
+          @producer.produce(res.strip, topic: @topic)
+        rescue => e
+          @logger.error("Got #{e.message} while trying to produce messages to kafka aborting ...")
+          exit 1
         end
       end
     rescue Exception => e
@@ -134,4 +125,5 @@ def gelfd
   end
 end
 
+kafka_connect
 gelfd
